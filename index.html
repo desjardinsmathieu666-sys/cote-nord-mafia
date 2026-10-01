@@ -1,0 +1,967 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <title>Côte-Nord Mafia — Sept-Îles</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="" />
+  <style>
+    :root {
+      --bg: #0b1220;
+      --panel: rgba(15, 23, 42, 0.78);
+      --panel-border: rgba(148, 163, 184, 0.28);
+      --accent: #38bdf8;
+      --danger: #ef4444;
+      --ok: #22c55e;
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+      --shadow: 0 12px 30px rgba(0, 0, 0, 0.35);
+    }
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: var(--bg); color: var(--text); font-family: Inter, Segoe UI, Roboto, Arial, sans-serif; }
+
+    #game {
+      position: fixed;
+      inset: 0;
+      display: block;
+      width: 100vw;
+      height: 100vh;
+      touch-action: none;
+      z-index: 400;
+      pointer-events: none;
+    }
+
+    #map {
+      position: fixed;
+      inset: 0;
+      z-index: 100;
+      filter: saturate(1.05) contrast(1.03) brightness(0.95);
+    }
+
+    .ui-layer {
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      z-index: 1000;
+    }
+
+    .hud {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      right: 10px;
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 10px;
+      pointer-events: none;
+    }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--panel-border);
+      border-radius: 12px;
+      backdrop-filter: blur(8px);
+      box-shadow: var(--shadow);
+      padding: 10px 12px;
+    }
+
+    .stats {
+      display: grid;
+      gap: 8px;
+    }
+
+    .bar {
+      height: 10px;
+      border-radius: 8px;
+      overflow: hidden;
+      background: rgba(30, 41, 59, 0.85);
+      border: 1px solid rgba(100, 116, 139, 0.35);
+    }
+
+    .bar > span {
+      display: block;
+      height: 100%;
+      width: 100%;
+      transition: width 0.2s linear;
+    }
+
+    .health { background: linear-gradient(90deg, #f97316, #ef4444); }
+    .stamina { background: linear-gradient(90deg, #22d3ee, #3b82f6); }
+
+    .row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      font-size: 14px;
+    }
+
+    .wanted {
+      font-size: 18px;
+      letter-spacing: 2px;
+      color: #fbbf24;
+      text-shadow: 0 0 8px rgba(251, 191, 36, 0.6);
+      white-space: nowrap;
+    }
+
+    .status {
+      position: absolute;
+      top: 126px;
+      left: 10px;
+      max-width: min(85vw, 520px);
+      pointer-events: none;
+      font-size: 13px;
+      color: var(--muted);
+    }
+
+    .status.error { color: #fca5a5; }
+    .status.ok { color: #86efac; }
+
+    .controls {
+      position: absolute;
+      right: 10px;
+      bottom: 10px;
+      display: grid;
+      grid-template-columns: repeat(2, minmax(96px, 1fr));
+      gap: 10px;
+      width: min(54vw, 230px);
+      pointer-events: auto;
+    }
+
+    .btn {
+      border: 1px solid rgba(148, 163, 184, 0.45);
+      border-radius: 12px;
+      background: rgba(15, 23, 42, 0.86);
+      color: #f8fafc;
+      font-size: 14px;
+      font-weight: 600;
+      padding: 13px 10px;
+      touch-action: manipulation;
+      box-shadow: var(--shadow);
+      cursor: pointer;
+      user-select: none;
+    }
+
+    .btn:active { transform: scale(0.98); }
+    .btn.crime { border-color: rgba(239, 68, 68, 0.6); }
+    .btn.interact { border-color: rgba(56, 189, 248, 0.6); }
+
+    .zoom-controls {
+      position: absolute;
+      right: 10px;
+      top: 152px;
+      display: grid;
+      gap: 8px;
+      pointer-events: auto;
+    }
+
+    .zoom-btn {
+      width: 46px;
+      height: 46px;
+      font-size: 24px;
+      line-height: 1;
+      border-radius: 10px;
+    }
+
+    .joystick {
+      position: absolute;
+      left: 10px;
+      bottom: 10px;
+      width: min(38vw, 180px);
+      aspect-ratio: 1 / 1;
+      border-radius: 50%;
+      border: 2px solid rgba(148, 163, 184, 0.4);
+      background: radial-gradient(circle at 35% 35%, rgba(148, 163, 184, 0.23), rgba(15, 23, 42, 0.72));
+      box-shadow: var(--shadow);
+      pointer-events: auto;
+      touch-action: none;
+      overflow: hidden;
+    }
+
+    .knob {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      width: 42%;
+      aspect-ratio: 1/1;
+      transform: translate(-50%, -50%);
+      border-radius: 50%;
+      background: radial-gradient(circle at 35% 35%, rgba(125, 211, 252, 0.9), rgba(30, 58, 138, 0.95));
+      border: 2px solid rgba(224, 242, 254, 0.8);
+      box-shadow: 0 8px 18px rgba(14, 116, 144, 0.45);
+      pointer-events: none;
+    }
+
+    #loadingOverlay {
+      position: fixed;
+      inset: 0;
+      z-index: 1500;
+      display: grid;
+      place-items: center;
+      background: radial-gradient(circle at center, rgba(11, 18, 32, 0.86), rgba(2, 6, 23, 0.95));
+      transition: opacity 0.35s ease;
+      pointer-events: none;
+    }
+
+    #loadingOverlay.hidden { opacity: 0; }
+
+    .loading-card {
+      width: min(92vw, 560px);
+      border-radius: 14px;
+      border: 1px solid rgba(148, 163, 184, 0.35);
+      background: rgba(15, 23, 42, 0.78);
+      box-shadow: var(--shadow);
+      padding: 18px;
+      text-align: center;
+    }
+
+    .loading-card h1 { margin: 0 0 8px; font-size: clamp(20px, 4vw, 32px); }
+    .loading-card p { margin: 6px 0; color: var(--muted); }
+
+    @media (max-width: 640px) {
+      .hud { grid-template-columns: 1fr; }
+      .wanted { font-size: 16px; }
+      .status { top: 158px; font-size: 12px; }
+      .controls { width: min(56vw, 220px); grid-template-columns: 1fr 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div id="map" aria-label="Carte de Sept-Îles"></div>
+  <canvas id="game" aria-label="Jeu Côte-Nord Mafia"></canvas>
+
+  <div class="ui-layer">
+    <div class="hud">
+      <div class="panel stats">
+        <div class="row"><strong>Santé</strong><span id="healthText">100</span></div>
+        <div class="bar"><span id="healthBar" class="health"></span></div>
+        <div class="row"><strong>Énergie</strong><span id="staminaText">100</span></div>
+        <div class="bar"><span id="staminaBar" class="stamina"></span></div>
+        <div class="row"><span>Argent: <strong id="moneyText">$1500</strong></span><span id="speedText">Vitesse: 0</span></div>
+      </div>
+      <div class="panel wanted" id="wantedStars">☆☆☆☆☆</div>
+    </div>
+
+    <div id="statusMsg" class="status">Initialisation de la ville...</div>
+
+    <div class="zoom-controls">
+      <button id="zoomIn" class="btn zoom-btn" type="button" aria-label="Zoom avant">+</button>
+      <button id="zoomOut" class="btn zoom-btn" type="button" aria-label="Zoom arrière">−</button>
+    </div>
+
+    <div class="joystick" id="joystick" aria-label="Joystick virtuel">
+      <div class="knob" id="joyKnob"></div>
+    </div>
+
+    <div class="controls">
+      <button id="runBtn" class="btn" type="button">COURIR</button>
+      <button id="interactBtn" class="btn interact" type="button">ENTRER/SORTIR</button>
+      <button id="crimeBtn" class="btn crime" type="button">CRIME</button>
+      <button id="brakeBtn" class="btn" type="button">FREIN</button>
+    </div>
+  </div>
+
+  <div id="loadingOverlay">
+    <div class="loading-card">
+      <h1>Côte-Nord Mafia</h1>
+      <p>Chargement de Sept-Îles...</p>
+      <p id="loadDetail">Préparation du moteur de jeu.</p>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
+  <script>
+    (() => {
+      'use strict';
+
+      const CITY = { lat: 50.213, lon: -66.38 };
+      const MAX_ZOOM = 18;
+      const MIN_ZOOM = 12;
+      const ROAD_FETCH_TIMEOUT_MS = 7000;
+
+      const dom = {
+        map: document.getElementById('map'),
+        canvas: document.getElementById('game'),
+        healthBar: document.getElementById('healthBar'),
+        staminaBar: document.getElementById('staminaBar'),
+        healthText: document.getElementById('healthText'),
+        staminaText: document.getElementById('staminaText'),
+        moneyText: document.getElementById('moneyText'),
+        speedText: document.getElementById('speedText'),
+        wantedStars: document.getElementById('wantedStars'),
+        statusMsg: document.getElementById('statusMsg'),
+        loadDetail: document.getElementById('loadDetail'),
+        loadingOverlay: document.getElementById('loadingOverlay'),
+        joystick: document.getElementById('joystick'),
+        joyKnob: document.getElementById('joyKnob'),
+        runBtn: document.getElementById('runBtn'),
+        interactBtn: document.getElementById('interactBtn'),
+        crimeBtn: document.getElementById('crimeBtn'),
+        brakeBtn: document.getElementById('brakeBtn'),
+        zoomIn: document.getElementById('zoomIn'),
+        zoomOut: document.getElementById('zoomOut')
+      };
+
+      if (Object.values(dom).some((el) => !el)) {
+        alert('Erreur DOM: certains éléments du jeu sont manquants.');
+        throw new Error('Missing DOM elements');
+      }
+
+      class RNG {
+        static range(min, max) { return Math.random() * (max - min) + min; }
+        static int(min, max) { return Math.floor(RNG.range(min, max + 1)); }
+      }
+
+      class Joystick {
+        constructor(root, knob) {
+          this.root = root;
+          this.knob = knob;
+          this.activeId = null;
+          this.vec = { x: 0, y: 0, force: 0 };
+          this.radius = 0;
+          this.center = { x: 0, y: 0 };
+          this.bind();
+          this.resize();
+          window.addEventListener('resize', () => this.resize());
+        }
+        resize() {
+          const rect = this.root.getBoundingClientRect();
+          this.radius = rect.width * 0.36;
+          this.center = { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+          if (!this.activeId) this.reset();
+        }
+        bind() {
+          const start = (e) => {
+            if (this.activeId !== null) return;
+            const point = this.getPoint(e);
+            if (!point) return;
+            this.activeId = point.id;
+            this.update(point.x, point.y);
+            e.preventDefault();
+          };
+          const move = (e) => {
+            if (this.activeId === null) return;
+            const point = this.getPoint(e, this.activeId);
+            if (!point) return;
+            this.update(point.x, point.y);
+            e.preventDefault();
+          };
+          const end = (e) => {
+            if (this.activeId === null) return;
+            const ended = this.hasId(e, this.activeId);
+            if (ended || e.type === 'pointerup' || e.type === 'pointercancel') {
+              this.activeId = null;
+              this.reset();
+            }
+          };
+
+          this.root.addEventListener('pointerdown', start, { passive: false });
+          window.addEventListener('pointermove', move, { passive: false });
+          window.addEventListener('pointerup', end, { passive: true });
+          window.addEventListener('pointercancel', end, { passive: true });
+        }
+        hasId(e, id) {
+          if (e.pointerId !== undefined) return e.pointerId === id;
+          return true;
+        }
+        getPoint(e, targetId = null) {
+          if (e.pointerId !== undefined) {
+            if (targetId !== null && e.pointerId !== targetId) return null;
+            return { x: e.clientX, y: e.clientY, id: e.pointerId };
+          }
+          return null;
+        }
+        update(x, y) {
+          const dx = x - this.center.x;
+          const dy = y - this.center.y;
+          const dist = Math.hypot(dx, dy) || 1;
+          const clamped = Math.min(dist, this.radius);
+          const nx = dx / dist;
+          const ny = dy / dist;
+          const kx = nx * clamped;
+          const ky = ny * clamped;
+
+          this.knob.style.transform = `translate(calc(-50% + ${kx}px), calc(-50% + ${ky}px))`;
+          this.vec.x = kx / this.radius;
+          this.vec.y = ky / this.radius;
+          this.vec.force = Math.min(1, clamped / this.radius);
+        }
+        reset() {
+          this.vec.x = 0;
+          this.vec.y = 0;
+          this.vec.force = 0;
+          this.knob.style.transform = 'translate(-50%, -50%)';
+        }
+      }
+
+      class MapSystem {
+        constructor() {
+          this.map = null;
+          this.roadSegments = [];
+          this.overpassReady = false;
+          this.overpassFailed = false;
+        }
+
+        initMap() {
+          this.map = L.map(dom.map, {
+            center: [CITY.lat, CITY.lon],
+            zoom: 15,
+            minZoom: MIN_ZOOM,
+            maxZoom: MAX_ZOOM,
+            zoomControl: false,
+            attributionControl: true,
+            preferCanvas: true
+          });
+
+          L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            maxZoom: MAX_ZOOM,
+            minZoom: MIN_ZOOM,
+            attribution: '&copy; OpenStreetMap contributors',
+            crossOrigin: true
+          }).addTo(this.map);
+        }
+
+        async loadRoadsOptional() {
+          const bbox = `${CITY.lat - 0.02},${CITY.lon - 0.03},${CITY.lat + 0.02},${CITY.lon + 0.03}`;
+          const query = `[out:json][timeout:25];(way["highway"](${bbox}););out geom;`;
+
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), ROAD_FETCH_TIMEOUT_MS);
+
+          try {
+            dom.loadDetail.textContent = 'Tentative de chargement des routes OSM (Overpass)...';
+            const response = await fetch('https://overpass-api.de/api/interpreter', {
+              method: 'POST',
+              body: query,
+              signal: controller.signal,
+              headers: { 'Content-Type': 'text/plain;charset=UTF-8' }
+            });
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+            const data = await response.json();
+            const ways = Array.isArray(data.elements) ? data.elements.filter((el) => el.type === 'way' && el.geometry?.length > 1) : [];
+            const segments = [];
+
+            for (const way of ways) {
+              for (let i = 1; i < way.geometry.length; i += 1) {
+                const a = way.geometry[i - 1];
+                const b = way.geometry[i];
+                segments.push([a.lat, a.lon, b.lat, b.lon]);
+              }
+            }
+
+            this.roadSegments = segments;
+            this.overpassReady = true;
+            dom.statusMsg.textContent = segments.length ? `Routes chargées: ${segments.length} segments.` : 'Aucune route trouvée, mode libre actif.';
+            dom.statusMsg.className = 'status ok';
+          } catch (err) {
+            this.overpassFailed = true;
+            this.roadSegments = [];
+            dom.statusMsg.textContent = 'Overpass indisponible: jeu lancé en mode libre sans routes détaillées.';
+            dom.statusMsg.className = 'status error';
+          } finally {
+            clearTimeout(timeout);
+          }
+        }
+
+        latLngToScreen(lat, lon) {
+          const p = this.map.latLngToContainerPoint([lat, lon]);
+          return { x: p.x, y: p.y };
+        }
+
+        screenToLatLng(x, y) {
+          const ll = this.map.containerPointToLatLng([x, y]);
+          return { lat: ll.lat, lon: ll.lng };
+        }
+
+        keepInBounds(entity) {
+          const mapBounds = this.map.getBounds().pad(-0.03);
+          entity.lat = Math.max(mapBounds.getSouth(), Math.min(mapBounds.getNorth(), entity.lat));
+          entity.lon = Math.max(mapBounds.getWest(), Math.min(mapBounds.getEast(), entity.lon));
+        }
+      }
+
+      class Player {
+        constructor() {
+          this.lat = CITY.lat;
+          this.lon = CITY.lon;
+          this.health = 100;
+          this.stamina = 100;
+          this.money = 1500;
+          this.heat = 0;
+          this.wantedTimer = 0;
+          this.inVehicle = null;
+          this.heading = 0;
+          this.speedMps = 0;
+        }
+
+        get wantedLevel() {
+          return Math.max(0, Math.min(5, Math.floor(this.heat / 20)));
+        }
+      }
+
+      class Vehicle {
+        constructor(lat, lon) {
+          this.lat = lat;
+          this.lon = lon;
+          this.speed = RNG.range(0.4, 1.5);
+          this.dir = RNG.range(0, Math.PI * 2);
+          this.color = `hsl(${RNG.int(180, 350)} 70% 58%)`;
+          this.stolen = false;
+          this.driver = false;
+        }
+
+        update(dt, mapSys) {
+          if (this.driver) return;
+          if (Math.random() < 0.02) this.dir += RNG.range(-0.7, 0.7);
+          this.lat += Math.sin(this.dir) * this.speed * dt * 0.00012;
+          this.lon += Math.cos(this.dir) * this.speed * dt * 0.0002;
+          mapSys.keepInBounds(this);
+        }
+      }
+
+      class Police {
+        constructor(lat, lon) {
+          this.lat = lat;
+          this.lon = lon;
+          this.speed = RNG.range(2.3, 3.2);
+          this.blink = 0;
+        }
+
+        update(dt, player, mapSys) {
+          const dx = player.lon - this.lon;
+          const dy = player.lat - this.lat;
+          const d = Math.hypot(dx, dy) || 1;
+          this.lon += (dx / d) * this.speed * dt * 0.00019;
+          this.lat += (dy / d) * this.speed * dt * 0.00012;
+          mapSys.keepInBounds(this);
+          this.blink += dt * 9;
+        }
+      }
+
+      class GameManager {
+        constructor() {
+          this.mapSystem = new MapSystem();
+          this.player = new Player();
+          this.vehicles = [];
+          this.police = [];
+          this.joystick = new Joystick(dom.joystick, dom.joyKnob);
+
+          this.canvas = dom.canvas;
+          this.ctx = this.canvas.getContext('2d', { alpha: true });
+          this.pixelRatio = Math.min(2, window.devicePixelRatio || 1);
+          this.lastTime = performance.now();
+          this.runPressed = false;
+          this.runLocked = false;
+          this.brakePressed = false;
+          this.keys = new Set();
+          this.effects = [];
+        }
+
+        async init() {
+          dom.loadDetail.textContent = 'Chargement de la carte Leaflet...';
+          this.mapSystem.initMap();
+          this.wireUI();
+          this.resize();
+
+          this.spawnVehicles(18);
+          requestAnimationFrame((t) => this.loop(t));
+
+          setTimeout(() => {
+            dom.loadingOverlay.classList.add('hidden');
+            setTimeout(() => dom.loadingOverlay.remove(), 500);
+          }, 500);
+
+          await this.mapSystem.loadRoadsOptional();
+        }
+
+        wireUI() {
+          window.addEventListener('resize', () => this.resize());
+
+          const setRun = (active) => {
+            this.runPressed = active;
+            dom.runBtn.style.background = active ? 'rgba(30,58,138,0.92)' : 'rgba(15,23,42,0.86)';
+          };
+
+          const bindHold = (button, onStart, onEnd) => {
+            button.addEventListener('pointerdown', (e) => { e.preventDefault(); onStart(); }, { passive: false });
+            window.addEventListener('pointerup', onEnd, { passive: true });
+            window.addEventListener('pointercancel', onEnd, { passive: true });
+          };
+
+          bindHold(dom.runBtn, () => setRun(true), () => setRun(false));
+          bindHold(dom.brakeBtn, () => { this.brakePressed = true; }, () => { this.brakePressed = false; });
+
+          dom.interactBtn.addEventListener('click', () => this.toggleVehicle());
+          dom.crimeBtn.addEventListener('click', () => this.commitCrime());
+          dom.zoomIn.addEventListener('click', () => this.mapSystem.map.zoomIn());
+          dom.zoomOut.addEventListener('click', () => this.mapSystem.map.zoomOut());
+
+          window.addEventListener('keydown', (e) => {
+            this.keys.add(e.key.toLowerCase());
+            if (e.key.toLowerCase() === 'e') this.toggleVehicle();
+            if (e.key.toLowerCase() === 'f') this.commitCrime();
+          });
+          window.addEventListener('keyup', (e) => this.keys.delete(e.key.toLowerCase()));
+
+          this.mapSystem.map.on('move', () => this.joystick.resize());
+        }
+
+        resize() {
+          const w = window.innerWidth;
+          const h = window.innerHeight;
+          this.canvas.style.width = `${w}px`;
+          this.canvas.style.height = `${h}px`;
+          this.canvas.width = Math.floor(w * this.pixelRatio);
+          this.canvas.height = Math.floor(h * this.pixelRatio);
+          this.ctx.setTransform(this.pixelRatio, 0, 0, this.pixelRatio, 0, 0);
+          this.joystick.resize();
+        }
+
+        spawnVehicles(count) {
+          for (let i = 0; i < count; i += 1) {
+            this.vehicles.push(new Vehicle(
+              CITY.lat + RNG.range(-0.008, 0.008),
+              CITY.lon + RNG.range(-0.012, 0.012)
+            ));
+          }
+        }
+
+        spawnPolice(targetCount) {
+          while (this.police.length < targetCount) {
+            const angle = RNG.range(0, Math.PI * 2);
+            const dist = RNG.range(0.004, 0.012);
+            this.police.push(new Police(
+              this.player.lat + Math.sin(angle) * dist,
+              this.player.lon + Math.cos(angle) * dist
+            ));
+          }
+        }
+
+        commitCrime() {
+          const gain = RNG.int(9, 28);
+          this.player.heat = Math.min(100, this.player.heat + gain);
+          this.player.money += RNG.int(50, 220);
+          this.player.wantedTimer = 32;
+          this.effects.push({ x: 0, y: 0, t: 0.8, type: 'crime' });
+          dom.statusMsg.textContent = `Crime commis: +${gain} heat.`;
+          dom.statusMsg.className = 'status error';
+          const needed = Math.max(0, this.player.wantedLevel);
+          if (needed > 0) this.spawnPolice(needed * 2);
+        }
+
+        nearestVehicle(maxMeters = 36) {
+          let best = null;
+          let bestDist = Infinity;
+          for (const v of this.vehicles) {
+            if (v.driver && this.player.inVehicle !== v) continue;
+            const d = this.distanceMeters(this.player.lat, this.player.lon, v.lat, v.lon);
+            if (d < bestDist) {
+              bestDist = d;
+              best = v;
+            }
+          }
+          return bestDist <= maxMeters ? best : null;
+        }
+
+        toggleVehicle() {
+          if (this.player.inVehicle) {
+            const car = this.player.inVehicle;
+            car.driver = false;
+            this.player.inVehicle = null;
+            this.player.lat += 0.00003;
+            dom.statusMsg.textContent = 'Sortie du véhicule.';
+            dom.statusMsg.className = 'status';
+            return;
+          }
+
+          const near = this.nearestVehicle();
+          if (!near) {
+            dom.statusMsg.textContent = 'Aucun véhicule à proximité.';
+            dom.statusMsg.className = 'status';
+            return;
+          }
+
+          near.driver = true;
+          near.stolen = true;
+          this.player.inVehicle = near;
+          this.player.heat = Math.min(100, this.player.heat + 12);
+          this.player.wantedTimer = Math.max(this.player.wantedTimer, 20);
+          dom.statusMsg.textContent = 'Véhicule volé!';
+          dom.statusMsg.className = 'status error';
+        }
+
+        distanceMeters(lat1, lon1, lat2, lon2) {
+          const R = 6371000;
+          const p1 = lat1 * Math.PI / 180;
+          const p2 = lat2 * Math.PI / 180;
+          const dLat = (lat2 - lat1) * Math.PI / 180;
+          const dLon = (lon2 - lon1) * Math.PI / 180;
+          const a = Math.sin(dLat / 2) ** 2 + Math.cos(p1) * Math.cos(p2) * Math.sin(dLon / 2) ** 2;
+          return 2 * R * Math.asin(Math.sqrt(a));
+        }
+
+        collectInput() {
+          let x = this.joystick.vec.x;
+          let y = this.joystick.vec.y;
+
+          if (this.keys.has('arrowleft') || this.keys.has('a')) x -= 1;
+          if (this.keys.has('arrowright') || this.keys.has('d')) x += 1;
+          if (this.keys.has('arrowup') || this.keys.has('w')) y -= 1;
+          if (this.keys.has('arrowdown') || this.keys.has('s')) y += 1;
+
+          const len = Math.hypot(x, y);
+          if (len > 1) {
+            x /= len;
+            y /= len;
+          }
+
+          const force = Math.max(this.joystick.vec.force, len > 0 ? 1 : 0);
+          return { x, y, force };
+        }
+
+        update(dt) {
+          const input = this.collectInput();
+          const sprint = this.runPressed || this.keys.has('shift');
+          const braking = this.brakePressed || this.keys.has(' ');
+
+          const walk = 1.7;
+          const run = 3.2;
+          const carSpeed = 6.8;
+
+          if (this.player.inVehicle) {
+            const car = this.player.inVehicle;
+            let speed = carSpeed * input.force;
+            if (sprint) speed *= 1.22;
+            if (braking) speed *= 0.35;
+
+            const moveX = input.x;
+            const moveY = input.y;
+            const angle = Math.atan2(moveY, moveX || 0.0001);
+
+            if (input.force > 0.02) {
+              this.player.heading = angle;
+              const factor = speed * dt;
+              this.player.lat += Math.sin(this.player.heading) * factor * 0.00013;
+              this.player.lon += Math.cos(this.player.heading) * factor * 0.0002;
+            }
+
+            car.lat = this.player.lat;
+            car.lon = this.player.lon;
+            this.player.speedMps = speed;
+            this.player.stamina = Math.min(100, this.player.stamina + dt * 12);
+          } else {
+            let speed = walk * input.force;
+            if (sprint && this.player.stamina > 0) {
+              speed = run * input.force;
+              this.player.stamina = Math.max(0, this.player.stamina - dt * (12 + input.force * 8));
+            } else {
+              this.player.stamina = Math.min(100, this.player.stamina + dt * 8);
+            }
+
+            if (input.force > 0.01) {
+              const angle = Math.atan2(input.y, input.x || 0.0001);
+              this.player.heading = angle;
+              const factor = speed * dt;
+              this.player.lat += Math.sin(this.player.heading) * factor * 0.00011;
+              this.player.lon += Math.cos(this.player.heading) * factor * 0.00017;
+            }
+            this.player.speedMps = speed;
+          }
+
+          this.mapSystem.keepInBounds(this.player);
+
+          const map = this.mapSystem.map;
+          map.panTo([this.player.lat, this.player.lon], { animate: false });
+
+          for (const v of this.vehicles) v.update(dt, this.mapSystem);
+
+          const wanted = this.player.wantedLevel;
+          if (wanted > 0) {
+            this.spawnPolice(wanted * 2);
+            for (const p of this.police) p.update(dt, this.player, this.mapSystem);
+
+            for (const p of this.police) {
+              const d = this.distanceMeters(this.player.lat, this.player.lon, p.lat, p.lon);
+              if (d < 10) {
+                this.player.health = Math.max(0, this.player.health - dt * (wanted * 1.4));
+                this.player.heat = Math.min(100, this.player.heat + dt * 2.1);
+              }
+            }
+          }
+
+          if (this.player.wantedTimer > 0) {
+            this.player.wantedTimer -= dt;
+          } else {
+            this.player.heat = Math.max(0, this.player.heat - dt * (this.player.inVehicle ? 1.1 : 1.9));
+            if (this.player.heat <= 0.5 && this.police.length > 0) {
+              this.police.length = 0;
+              dom.statusMsg.textContent = 'Recherche terminée, secteur calme.';
+              dom.statusMsg.className = 'status ok';
+            }
+          }
+
+          for (const fx of this.effects) fx.t -= dt;
+          this.effects = this.effects.filter((fx) => fx.t > 0);
+
+          if (this.player.health <= 0) {
+            this.player.health = 100;
+            this.player.heat = 0;
+            this.player.wantedTimer = 0;
+            this.player.money = Math.max(0, this.player.money - 300);
+            this.player.lat = CITY.lat;
+            this.player.lon = CITY.lon;
+            this.police.length = 0;
+            this.player.inVehicle = null;
+            dom.statusMsg.textContent = 'Tu as été neutralisé. Réapparition en ville.';
+            dom.statusMsg.className = 'status error';
+          }
+
+          this.updateHud();
+        }
+
+        updateHud() {
+          dom.healthBar.style.width = `${this.player.health.toFixed(0)}%`;
+          dom.staminaBar.style.width = `${this.player.stamina.toFixed(0)}%`;
+          dom.healthText.textContent = `${this.player.health.toFixed(0)}`;
+          dom.staminaText.textContent = `${this.player.stamina.toFixed(0)}`;
+          dom.moneyText.textContent = `$${Math.floor(this.player.money)}`;
+          dom.speedText.textContent = `Vitesse: ${this.player.speedMps.toFixed(1)} m/s`;
+
+          const lvl = this.player.wantedLevel;
+          dom.wantedStars.textContent = '★'.repeat(lvl) + '☆'.repeat(5 - lvl);
+        }
+
+        drawRoadHints() {
+          if (!this.mapSystem.roadSegments.length) return;
+          const ctx = this.ctx;
+          ctx.save();
+          ctx.lineWidth = 1.5;
+          ctx.strokeStyle = 'rgba(99, 102, 241, 0.34)';
+          ctx.beginPath();
+          const max = Math.min(520, this.mapSystem.roadSegments.length);
+          for (let i = 0; i < max; i += 1) {
+            const seg = this.mapSystem.roadSegments[i];
+            const a = this.mapSystem.latLngToScreen(seg[0], seg[1]);
+            const b = this.mapSystem.latLngToScreen(seg[2], seg[3]);
+            ctx.moveTo(a.x, a.y);
+            ctx.lineTo(b.x, b.y);
+          }
+          ctx.stroke();
+          ctx.restore();
+        }
+
+        drawEntity(lat, lon, opts) {
+          const p = this.mapSystem.latLngToScreen(lat, lon);
+          const ctx = this.ctx;
+
+          ctx.save();
+          if (opts.shadow !== false) {
+            ctx.fillStyle = 'rgba(0,0,0,0.25)';
+            ctx.beginPath();
+            ctx.ellipse(p.x + 2, p.y + (opts.size || 8), (opts.size || 8) * 0.9, (opts.size || 8) * 0.5, 0, 0, Math.PI * 2);
+            ctx.fill();
+          }
+
+          ctx.translate(p.x, p.y);
+          ctx.rotate(opts.rot || 0);
+
+          if (opts.type === 'player') {
+            ctx.fillStyle = '#22d3ee';
+            ctx.beginPath();
+            ctx.moveTo(12, 0);
+            ctx.lineTo(-8, -7);
+            ctx.lineTo(-8, 7);
+            ctx.closePath();
+            ctx.fill();
+            ctx.strokeStyle = '#e0f2fe';
+            ctx.lineWidth = 2;
+            ctx.stroke();
+          } else if (opts.type === 'vehicle') {
+            ctx.fillStyle = opts.color;
+            ctx.fillRect(-12, -7, 24, 14);
+            ctx.fillStyle = 'rgba(17,24,39,0.8)';
+            ctx.fillRect(-7, -5, 14, 10);
+          } else if (opts.type === 'police') {
+            const blinkOn = Math.floor(opts.blink || 0) % 2 === 0;
+            ctx.fillStyle = blinkOn ? '#3b82f6' : '#ef4444';
+            ctx.fillRect(-10, -6, 20, 12);
+            ctx.fillStyle = '#f8fafc';
+            ctx.fillRect(-4, -6, 8, 4);
+          }
+          ctx.restore();
+        }
+
+        drawEffects() {
+          const ctx = this.ctx;
+          const center = this.mapSystem.latLngToScreen(this.player.lat, this.player.lon);
+
+          for (const fx of this.effects) {
+            if (fx.type !== 'crime') continue;
+            const alpha = Math.max(0, fx.t / 0.8);
+            const radius = (1 - alpha) * 90;
+            ctx.save();
+            ctx.strokeStyle = `rgba(239,68,68,${alpha})`;
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.arc(center.x, center.y, radius, 0, Math.PI * 2);
+            ctx.stroke();
+            ctx.restore();
+          }
+        }
+
+        render() {
+          this.ctx.clearRect(0, 0, this.canvas.width / this.pixelRatio, this.canvas.height / this.pixelRatio);
+
+          this.drawRoadHints();
+
+          for (const v of this.vehicles) {
+            this.drawEntity(v.lat, v.lon, { type: 'vehicle', color: v.color, size: 10, rot: v.dir });
+          }
+
+          for (const p of this.police) {
+            this.drawEntity(p.lat, p.lon, { type: 'police', size: 10, blink: p.blink });
+          }
+
+          this.drawEntity(this.player.lat, this.player.lon, {
+            type: 'player',
+            size: this.player.inVehicle ? 0 : 9,
+            rot: this.player.heading
+          });
+
+          this.drawEffects();
+        }
+
+        loop(ts) {
+          const dt = Math.min(0.033, (ts - this.lastTime) / 1000);
+          this.lastTime = ts;
+          this.update(dt);
+          this.render();
+          requestAnimationFrame((t) => this.loop(t));
+        }
+      }
+
+      async function start() {
+        if (!window.L || typeof window.L.map !== 'function') {
+          dom.statusMsg.textContent = 'Leaflet indisponible: impossible d\'afficher la carte.';
+          dom.statusMsg.className = 'status error';
+          dom.loadDetail.textContent = 'Erreur: CDN Leaflet inaccessible.';
+          return;
+        }
+
+        try {
+          const game = new GameManager();
+          await game.init();
+        } catch (err) {
+          console.error(err);
+          dom.statusMsg.textContent = 'Erreur critique au démarrage du jeu.';
+          dom.statusMsg.className = 'status error';
+          dom.loadDetail.textContent = 'Le jeu a rencontré une erreur inattendue.';
+        }
+      }
+
+      start();
+    })();
+  </script>
+</body>
+</html>
