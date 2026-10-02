@@ -278,6 +278,7 @@
       const MAX_ZOOM = 18;
       const MIN_ZOOM = 12;
       const ROAD_FETCH_TIMEOUT_MS = 7000;
+      const ROAD_GRID_SIZE = 0.0015;
 
       const dom = {
         map: document.getElementById('map'),
@@ -328,14 +329,18 @@
           const rect = this.root.getBoundingClientRect();
           this.radius = rect.width * 0.36;
           this.center = { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
-          if (!this.activeId) this.reset();
+          if (this.activeId === null) this.reset();
         }
         bind() {
           const start = (e) => {
             if (this.activeId !== null) return;
+            if (e.pointerType === 'mouse' && e.button !== 0) return;
             const point = this.getPoint(e);
             if (!point) return;
             this.activeId = point.id;
+            if (e.pointerId !== undefined && this.root.setPointerCapture) {
+              this.root.setPointerCapture(e.pointerId);
+            }
             this.update(point.x, point.y);
             e.preventDefault();
           };
@@ -397,9 +402,42 @@
       class MapSystem {
         constructor() {
           this.map = null;
+          this.layers = {};
+          this.satelliteFailed = false;
+          this.satelliteErrorCount = 0;
           this.roadSegments = [];
+          this.roadNodes = [];
+          this.roadAdj = [];
+          this.nodeGrid = new Map();
+          this.segmentGrid = new Map();
           this.overpassReady = false;
           this.overpassFailed = false;
+        }
+
+        gridKey(lat, lon) {
+          const gy = Math.floor(lat / ROAD_GRID_SIZE);
+          const gx = Math.floor(lon / ROAD_GRID_SIZE);
+          return `${gy}:${gx}`;
+        }
+
+        indexIntoGrid(grid, lat, lon, value) {
+          const key = this.gridKey(lat, lon);
+          if (!grid.has(key)) grid.set(key, []);
+          grid.get(key).push(value);
+        }
+
+        queryGrid(grid, lat, lon, radius = 1) {
+          const gy = Math.floor(lat / ROAD_GRID_SIZE);
+          const gx = Math.floor(lon / ROAD_GRID_SIZE);
+          const out = [];
+          for (let y = gy - radius; y <= gy + radius; y += 1) {
+            for (let x = gx - radius; x <= gx + radius; x += 1) {
+              const key = `${y}:${x}`;
+              if (!grid.has(key)) continue;
+              out.push(...grid.get(key));
+            }
+          }
+          return out;
         }
 
         initMap() {
@@ -413,12 +451,44 @@
             preferCanvas: true
           });
 
-          L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+          this.layers.satellite = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+            maxZoom: MAX_ZOOM,
+            minZoom: MIN_ZOOM,
+            attribution: 'Tiles &copy; Esri',
+            crossOrigin: true
+          });
+          this.layers.fallback = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
             maxZoom: MAX_ZOOM,
             minZoom: MIN_ZOOM,
             attribution: '&copy; OpenStreetMap contributors',
             crossOrigin: true
-          }).addTo(this.map);
+          });
+          this.layers.roadsLabels = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            maxZoom: MAX_ZOOM,
+            minZoom: MIN_ZOOM,
+            opacity: 0.34,
+            attribution: '&copy; OpenStreetMap contributors',
+            crossOrigin: true
+          });
+
+          this.layers.satellite.on('tileerror', () => {
+            this.satelliteErrorCount += 1;
+            if (!this.satelliteFailed && this.satelliteErrorCount >= 4) {
+              this.satelliteFailed = true;
+              if (this.map.hasLayer(this.layers.satellite)) this.map.removeLayer(this.layers.satellite);
+              this.layers.fallback.addTo(this.map);
+              dom.statusMsg.textContent = 'Imagerie satellite indisponible, bascule sur fond public de secours.';
+              dom.statusMsg.className = 'status error';
+            }
+          });
+
+          this.layers.satellite.addTo(this.map);
+          this.layers.roadsLabels.addTo(this.map);
+          L.control.layers(
+            { 'Satellite': this.layers.satellite, 'Plan de secours': this.layers.fallback },
+            { 'Routes + labels': this.layers.roadsLabels },
+            { collapsed: true }
+          ).addTo(this.map);
         }
 
         async loadRoadsOptional() {
@@ -440,28 +510,171 @@
 
             const data = await response.json();
             const ways = Array.isArray(data.elements) ? data.elements.filter((el) => el.type === 'way' && el.geometry?.length > 1) : [];
-            const segments = [];
+            this.buildRoadNetwork(ways);
 
-            for (const way of ways) {
-              for (let i = 1; i < way.geometry.length; i += 1) {
-                const a = way.geometry[i - 1];
-                const b = way.geometry[i];
-                segments.push([a.lat, a.lon, b.lat, b.lon]);
-              }
-            }
-
-            this.roadSegments = segments;
             this.overpassReady = true;
-            dom.statusMsg.textContent = segments.length ? `Routes chargées: ${segments.length} segments.` : 'Aucune route trouvée, mode libre actif.';
+            dom.statusMsg.textContent = this.roadSegments.length ? `Routes chargées: ${this.roadSegments.length} segments.` : 'Aucune route trouvée, mode libre actif.';
             dom.statusMsg.className = 'status ok';
           } catch (err) {
             this.overpassFailed = true;
             this.roadSegments = [];
+            this.roadNodes = [];
+            this.roadAdj = [];
+            this.nodeGrid = new Map();
+            this.segmentGrid = new Map();
             dom.statusMsg.textContent = 'Overpass indisponible: jeu lancé en mode libre sans routes détaillées.';
             dom.statusMsg.className = 'status error';
           } finally {
             clearTimeout(timeout);
           }
+        }
+
+        buildRoadNetwork(ways) {
+          const nodeByKey = new Map();
+          this.roadSegments = [];
+          this.roadNodes = [];
+          this.roadAdj = [];
+          this.nodeGrid = new Map();
+          this.segmentGrid = new Map();
+
+          const getNodeIndex = (lat, lon) => {
+            const key = `${lat.toFixed(6)}:${lon.toFixed(6)}`;
+            if (nodeByKey.has(key)) return nodeByKey.get(key);
+            const idx = this.roadNodes.length;
+            this.roadNodes.push({ lat, lon });
+            this.roadAdj.push([]);
+            nodeByKey.set(key, idx);
+            this.indexIntoGrid(this.nodeGrid, lat, lon, idx);
+            return idx;
+          };
+
+          for (const way of ways) {
+            let prev = null;
+            for (const node of way.geometry) {
+              const current = getNodeIndex(node.lat, node.lon);
+              if (prev !== null && prev !== current) {
+                const a = this.roadNodes[prev];
+                const b = this.roadNodes[current];
+                this.roadAdj[prev].push(current);
+                this.roadAdj[current].push(prev);
+                const dy = b.lat - a.lat;
+                const dx = b.lon - a.lon;
+                const len2 = (dy * dy) + (dx * dx);
+                if (len2 > 0) {
+                  const seg = { aLat: a.lat, aLon: a.lon, bLat: b.lat, bLon: b.lon, a: prev, b: current, dx, dy, len2 };
+                  const segIdx = this.roadSegments.length;
+                  this.roadSegments.push(seg);
+                  const minLat = Math.min(seg.aLat, seg.bLat);
+                  const maxLat = Math.max(seg.aLat, seg.bLat);
+                  const minLon = Math.min(seg.aLon, seg.bLon);
+                  const maxLon = Math.max(seg.aLon, seg.bLon);
+                  const y0 = Math.floor(minLat / ROAD_GRID_SIZE);
+                  const y1 = Math.floor(maxLat / ROAD_GRID_SIZE);
+                  const x0 = Math.floor(minLon / ROAD_GRID_SIZE);
+                  const x1 = Math.floor(maxLon / ROAD_GRID_SIZE);
+                  for (let y = y0; y <= y1; y += 1) {
+                    for (let x = x0; x <= x1; x += 1) {
+                      const key = `${y}:${x}`;
+                      if (!this.segmentGrid.has(key)) this.segmentGrid.set(key, []);
+                      this.segmentGrid.get(key).push(segIdx);
+                    }
+                  }
+                }
+              }
+              prev = current;
+            }
+          }
+        }
+
+        hasRoadNetwork() {
+          return this.roadNodes.length > 1 && this.roadSegments.length > 0;
+        }
+
+        squaredDistance(latA, lonA, latB, lonB) {
+          const dy = latA - latB;
+          const dx = lonA - lonB;
+          return (dy * dy) + (dx * dx);
+        }
+
+        nearestRoadNode(lat, lon, cache = null) {
+          if (!this.hasRoadNetwork()) return null;
+          if (cache?.nodeIdx != null) {
+            const cached = this.roadNodes[cache.nodeIdx];
+            if (cached && this.squaredDistance(lat, lon, cached.lat, cached.lon) < 0.00000009) {
+              return cache.nodeIdx;
+            }
+          }
+          let candidates = this.queryGrid(this.nodeGrid, lat, lon, 1);
+          if (!candidates.length) candidates = this.queryGrid(this.nodeGrid, lat, lon, 2);
+          if (!candidates.length) return null;
+          let best = null;
+          let bestD = Infinity;
+          for (const idx of candidates) {
+            const node = this.roadNodes[idx];
+            const d = this.squaredDistance(lat, lon, node.lat, node.lon);
+            if (d < bestD) {
+              bestD = d;
+              best = idx;
+            }
+          }
+          if (cache && best !== null) cache.nodeIdx = best;
+          return best;
+        }
+
+        nearestRoadSegment(lat, lon, cache = null) {
+          if (!this.hasRoadNetwork()) return null;
+          if (cache?.segIdx != null) {
+            const seg = this.roadSegments[cache.segIdx];
+            if (seg) return { seg, segIdx: cache.segIdx };
+          }
+          let candidates = this.queryGrid(this.segmentGrid, lat, lon, 1);
+          if (!candidates.length) candidates = this.queryGrid(this.segmentGrid, lat, lon, 2);
+          if (!candidates.length) return null;
+          let bestIdx = null;
+          let bestD = Infinity;
+          for (const segIdx of candidates) {
+            const seg = this.roadSegments[segIdx];
+            const apLat = lat - seg.aLat;
+            const apLon = lon - seg.aLon;
+            const t = Math.max(0, Math.min(1, ((apLat * seg.dy) + (apLon * seg.dx)) / seg.len2));
+            const py = seg.aLat + seg.dy * t;
+            const px = seg.aLon + seg.dx * t;
+            const d = this.squaredDistance(lat, lon, py, px);
+            if (d < bestD) {
+              bestD = d;
+              bestIdx = segIdx;
+            }
+          }
+          if (bestIdx === null) return null;
+          if (cache) cache.segIdx = bestIdx;
+          return { seg: this.roadSegments[bestIdx], segIdx: bestIdx };
+        }
+
+        projectMoveOnRoad(lat, lon, moveLat, moveLon, cache = null) {
+          const nearest = this.nearestRoadSegment(lat, lon, cache);
+          if (!nearest) return null;
+          const { seg } = nearest;
+          const apLat = lat - seg.aLat;
+          const apLon = lon - seg.aLon;
+          const t = Math.max(0, Math.min(1, ((apLat * seg.dy) + (apLon * seg.dx)) / seg.len2));
+          const projLat = seg.aLat + seg.dy * t;
+          const projLon = seg.aLon + seg.dx * t;
+          if (this.squaredDistance(lat, lon, projLat, projLon) > 0.00000004) return null;
+          const len = Math.hypot(seg.dy, seg.dx) || 1;
+          let dirLat = seg.dy / len;
+          let dirLon = seg.dx / len;
+          if ((dirLat * moveLat) + (dirLon * moveLon) < 0) {
+            dirLat *= -1;
+            dirLon *= -1;
+          }
+          const projStep = (moveLat * dirLat) + (moveLon * dirLon);
+          const rawLat = projLat + dirLat * projStep;
+          const rawLon = projLon + dirLon * projStep;
+          const tNext = Math.max(0, Math.min(1, (((rawLat - seg.aLat) * seg.dy) + ((rawLon - seg.aLon) * seg.dx)) / seg.len2));
+          const nextLat = seg.aLat + seg.dy * tNext;
+          const nextLon = seg.aLon + seg.dx * tNext;
+          const heading = Math.atan2(dirLat, dirLon);
+          return { lat: nextLat, lon: nextLon, heading };
         }
 
         latLngToScreen(lat, lon) {
@@ -493,6 +706,7 @@
           this.inVehicle = null;
           this.heading = 0;
           this.speedMps = 0;
+          this.roadCache = { nodeIdx: null, segIdx: null };
         }
 
         get wantedLevel() {
@@ -509,13 +723,46 @@
           this.color = `hsl(${RNG.int(180, 350)} 70% 58%)`;
           this.stolen = false;
           this.driver = false;
+          this.roadCache = { nodeIdx: null, segIdx: null };
+          this.roadNode = null;
+          this.roadTarget = null;
+          this.lastRoadNode = null;
         }
 
         update(dt, mapSys) {
           if (this.driver) return;
-          if (Math.random() < 0.02) this.dir += RNG.range(-0.7, 0.7);
-          this.lat += Math.sin(this.dir) * this.speed * dt * 0.00012;
-          this.lon += Math.cos(this.dir) * this.speed * dt * 0.0002;
+          if (mapSys.hasRoadNetwork()) {
+            if (this.roadNode === null) this.roadNode = mapSys.nearestRoadNode(this.lat, this.lon, this.roadCache);
+            if (this.roadTarget === null && this.roadNode !== null) {
+              const options = mapSys.roadAdj[this.roadNode] || [];
+              if (options.length) this.roadTarget = options[RNG.int(0, options.length - 1)];
+            }
+            if (this.roadTarget !== null) {
+              const target = mapSys.roadNodes[this.roadTarget];
+              const dLat = target.lat - this.lat;
+              const dLon = target.lon - this.lon;
+              const d = Math.hypot(dLat, dLon) || 1;
+              const step = this.speed * dt * 0.00017;
+              if (d <= step * 1.2) {
+                this.lat = target.lat;
+                this.lon = target.lon;
+                this.lastRoadNode = this.roadNode;
+                this.roadNode = this.roadTarget;
+                this.roadCache.nodeIdx = this.roadNode;
+                const neighbors = (mapSys.roadAdj[this.roadNode] || []).filter((idx) => idx !== this.lastRoadNode);
+                const pool = neighbors.length ? neighbors : (mapSys.roadAdj[this.roadNode] || []);
+                this.roadTarget = pool.length ? pool[RNG.int(0, pool.length - 1)] : null;
+              } else {
+                this.lat += (dLat / d) * step;
+                this.lon += (dLon / d) * step;
+              }
+              this.dir = Math.atan2(dLat, dLon);
+            }
+          } else {
+            if (Math.random() < 0.02) this.dir += RNG.range(-0.7, 0.7);
+            this.lat += Math.sin(this.dir) * this.speed * dt * 0.00012;
+            this.lon += Math.cos(this.dir) * this.speed * dt * 0.0002;
+          }
           mapSys.keepInBounds(this);
         }
       }
@@ -526,14 +773,65 @@
           this.lon = lon;
           this.speed = RNG.range(2.3, 3.2);
           this.blink = 0;
+          this.dir = 0;
+          this.roadCache = { nodeIdx: null, segIdx: null };
+          this.roadNode = null;
+          this.roadTarget = null;
+          this.lastRoadNode = null;
+          this.targetNode = null;
         }
 
         update(dt, player, mapSys) {
-          const dx = player.lon - this.lon;
-          const dy = player.lat - this.lat;
-          const d = Math.hypot(dx, dy) || 1;
-          this.lon += (dx / d) * this.speed * dt * 0.00019;
-          this.lat += (dy / d) * this.speed * dt * 0.00012;
+          if (mapSys.hasRoadNetwork()) {
+            if (this.roadNode === null) this.roadNode = mapSys.nearestRoadNode(this.lat, this.lon, this.roadCache);
+            this.targetNode = mapSys.nearestRoadNode(player.lat, player.lon, player.roadCache);
+            if (this.roadNode !== null && this.targetNode !== null) {
+              if (this.roadTarget === null || this.roadTarget === this.roadNode) {
+                const neighbors = mapSys.roadAdj[this.roadNode] || [];
+                if (neighbors.length) {
+                  let best = neighbors[0];
+                  let bestD = Infinity;
+                  for (const n of neighbors) {
+                    if (n === this.lastRoadNode && neighbors.length > 1) continue;
+                    const node = mapSys.roadNodes[n];
+                    const target = mapSys.roadNodes[this.targetNode];
+                    const d = mapSys.squaredDistance(node.lat, node.lon, target.lat, target.lon);
+                    if (d < bestD) {
+                      bestD = d;
+                      best = n;
+                    }
+                  }
+                  this.roadTarget = best;
+                }
+              }
+              if (this.roadTarget !== null) {
+                const target = mapSys.roadNodes[this.roadTarget];
+                const dLat = target.lat - this.lat;
+                const dLon = target.lon - this.lon;
+                const d = Math.hypot(dLat, dLon) || 1;
+                const step = this.speed * dt * 0.0002;
+                if (d <= step * 1.3) {
+                  this.lat = target.lat;
+                  this.lon = target.lon;
+                  this.lastRoadNode = this.roadNode;
+                  this.roadNode = this.roadTarget;
+                  this.roadCache.nodeIdx = this.roadNode;
+                  this.roadTarget = null;
+                } else {
+                  this.lat += (dLat / d) * step;
+                  this.lon += (dLon / d) * step;
+                }
+                this.dir = Math.atan2(dLat, dLon);
+              }
+            }
+          } else {
+            const dx = player.lon - this.lon;
+            const dy = player.lat - this.lat;
+            const d = Math.hypot(dx, dy) || 1;
+            this.lon += (dx / d) * this.speed * dt * 0.00019;
+            this.lat += (dy / d) * this.speed * dt * 0.00012;
+            this.dir = Math.atan2(dy, dx);
+          }
           mapSys.keepInBounds(this);
           this.blink += dt * 9;
         }
@@ -552,9 +850,8 @@
           this.pixelRatio = Math.min(2, window.devicePixelRatio || 1);
           this.lastTime = performance.now();
           this.runPressed = false;
-          this.runLocked = false;
           this.brakePressed = false;
-          this.keys = new Set();
+          this.keyState = { up: false, down: false, left: false, right: false, run: false, brake: false };
           this.effects = [];
         }
 
@@ -598,13 +895,62 @@
           dom.zoomOut.addEventListener('click', () => this.mapSystem.map.zoomOut());
 
           window.addEventListener('keydown', (e) => {
-            this.keys.add(e.key.toLowerCase());
-            if (e.key.toLowerCase() === 'e') this.toggleVehicle();
-            if (e.key.toLowerCase() === 'f') this.commitCrime();
+            this.setKeyState(e, true);
+            if (e.code === 'KeyE') this.toggleVehicle();
+            if (e.code === 'KeyF') this.commitCrime();
           });
-          window.addEventListener('keyup', (e) => this.keys.delete(e.key.toLowerCase()));
+          window.addEventListener('keyup', (e) => this.setKeyState(e, false));
+          window.addEventListener('blur', () => this.resetInputs());
+          document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState !== 'visible') this.resetInputs();
+          });
 
           this.mapSystem.map.on('move', () => this.joystick.resize());
+        }
+
+        resetInputs() {
+          this.keyState = { up: false, down: false, left: false, right: false, run: false, brake: false };
+          this.runPressed = false;
+          this.brakePressed = false;
+        }
+
+        setKeyState(e, active) {
+          let handled = true;
+          switch (e.code) {
+            case 'ArrowUp':
+            case 'KeyW':
+              this.keyState.up = active;
+              break;
+            case 'ArrowDown':
+            case 'KeyS':
+              this.keyState.down = active;
+              break;
+            case 'ArrowLeft':
+            case 'KeyA':
+              this.keyState.left = active;
+              break;
+            case 'ArrowRight':
+            case 'KeyD':
+              this.keyState.right = active;
+              break;
+            case 'ShiftLeft':
+            case 'ShiftRight':
+              this.keyState.run = active;
+              break;
+            case 'Space':
+              this.keyState.brake = active;
+              break;
+            default:
+              handled = false;
+          }
+          if (handled) e.preventDefault();
+        }
+
+        smoothAngle(current, target, amount = 0.22) {
+          let delta = target - current;
+          while (delta > Math.PI) delta -= Math.PI * 2;
+          while (delta < -Math.PI) delta += Math.PI * 2;
+          return current + delta * amount;
         }
 
         resize() {
@@ -669,7 +1015,8 @@
             const car = this.player.inVehicle;
             car.driver = false;
             this.player.inVehicle = null;
-            this.player.lat += 0.00003;
+            this.player.lat += Math.sin(this.player.heading + Math.PI / 2) * 0.00004;
+            this.player.lon += Math.cos(this.player.heading + Math.PI / 2) * 0.00005;
             dom.statusMsg.textContent = 'Sortie du véhicule.';
             dom.statusMsg.className = 'status';
             return;
@@ -702,28 +1049,35 @@
         }
 
         collectInput() {
-          let x = this.joystick.vec.x;
-          let y = this.joystick.vec.y;
+          let kx = 0;
+          let ky = 0;
+          if (this.keyState.left) kx -= 1;
+          if (this.keyState.right) kx += 1;
+          if (this.keyState.up) ky -= 1;
+          if (this.keyState.down) ky += 1;
 
-          if (this.keys.has('arrowleft') || this.keys.has('a')) x -= 1;
-          if (this.keys.has('arrowright') || this.keys.has('d')) x += 1;
-          if (this.keys.has('arrowup') || this.keys.has('w')) y -= 1;
-          if (this.keys.has('arrowdown') || this.keys.has('s')) y += 1;
-
-          const len = Math.hypot(x, y);
-          if (len > 1) {
-            x /= len;
-            y /= len;
+          const keyLen = Math.hypot(kx, ky);
+          if (keyLen > 1) {
+            kx /= keyLen;
+            ky /= keyLen;
           }
 
-          const force = Math.max(this.joystick.vec.force, len > 0 ? 1 : 0);
+          let x = this.joystick.vec.x + kx;
+          let y = this.joystick.vec.y + ky;
+          const totalLen = Math.hypot(x, y);
+          if (totalLen > 1) {
+            x /= totalLen;
+            y /= totalLen;
+          }
+
+          const force = Math.max(this.joystick.vec.force, keyLen > 0 ? 1 : 0, Math.hypot(x, y));
           return { x, y, force };
         }
 
         update(dt) {
           const input = this.collectInput();
-          const sprint = this.runPressed || this.keys.has('shift');
-          const braking = this.brakePressed || this.keys.has(' ');
+          const sprint = this.runPressed || this.keyState.run;
+          const braking = this.brakePressed || this.keyState.brake;
 
           const walk = 1.7;
           const run = 3.2;
@@ -740,10 +1094,19 @@
             const angle = Math.atan2(moveY, moveX || 0.0001);
 
             if (input.force > 0.02) {
-              this.player.heading = angle;
+              this.player.heading = this.smoothAngle(this.player.heading, angle);
               const factor = speed * dt;
-              this.player.lat += Math.sin(this.player.heading) * factor * 0.00013;
-              this.player.lon += Math.cos(this.player.heading) * factor * 0.0002;
+              const moveLat = Math.sin(angle) * factor * 0.00013;
+              const moveLon = Math.cos(angle) * factor * 0.0002;
+              const constrained = this.mapSystem.projectMoveOnRoad(this.player.lat, this.player.lon, moveLat, moveLon, this.player.roadCache);
+              if (constrained) {
+                this.player.lat = constrained.lat;
+                this.player.lon = constrained.lon;
+                this.player.heading = this.smoothAngle(this.player.heading, constrained.heading, 0.3);
+              } else {
+                this.player.lat += moveLat;
+                this.player.lon += moveLon;
+              }
             }
 
             car.lat = this.player.lat;
@@ -761,7 +1124,7 @@
 
             if (input.force > 0.01) {
               const angle = Math.atan2(input.y, input.x || 0.0001);
-              this.player.heading = angle;
+              this.player.heading = this.smoothAngle(this.player.heading, angle, 0.28);
               const factor = speed * dt;
               this.player.lat += Math.sin(this.player.heading) * factor * 0.00011;
               this.player.lon += Math.cos(this.player.heading) * factor * 0.00017;
@@ -842,8 +1205,8 @@
           const max = Math.min(520, this.mapSystem.roadSegments.length);
           for (let i = 0; i < max; i += 1) {
             const seg = this.mapSystem.roadSegments[i];
-            const a = this.mapSystem.latLngToScreen(seg[0], seg[1]);
-            const b = this.mapSystem.latLngToScreen(seg[2], seg[3]);
+            const a = this.mapSystem.latLngToScreen(seg.aLat, seg.aLon);
+            const b = this.mapSystem.latLngToScreen(seg.bLat, seg.bLon);
             ctx.moveTo(a.x, a.y);
             ctx.lineTo(b.x, b.y);
           }
@@ -867,29 +1230,84 @@
           ctx.rotate(opts.rot || 0);
 
           if (opts.type === 'player') {
-            ctx.fillStyle = '#22d3ee';
+            ctx.fillStyle = '#0f172a';
             ctx.beginPath();
-            ctx.moveTo(12, 0);
-            ctx.lineTo(-8, -7);
-            ctx.lineTo(-8, 7);
-            ctx.closePath();
+            this.roundRect(ctx, -4, -4, 8, 12, 2);
             ctx.fill();
-            ctx.strokeStyle = '#e0f2fe';
-            ctx.lineWidth = 2;
+            ctx.fillStyle = '#f8fafc';
+            ctx.beginPath();
+            ctx.arc(0, -8, 4.2, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.strokeStyle = '#22d3ee';
+            ctx.lineWidth = 2.3;
+            ctx.beginPath();
+            ctx.moveTo(-7, 3);
+            ctx.lineTo(7, 3);
+            ctx.moveTo(-3, 8);
+            ctx.lineTo(-5, 13);
+            ctx.moveTo(3, 8);
+            ctx.lineTo(5, 13);
             ctx.stroke();
           } else if (opts.type === 'vehicle') {
             ctx.fillStyle = opts.color;
-            ctx.fillRect(-12, -7, 24, 14);
-            ctx.fillStyle = 'rgba(17,24,39,0.8)';
-            ctx.fillRect(-7, -5, 14, 10);
+            ctx.beginPath();
+            this.roundRect(ctx, -13, -7, 26, 14, 5);
+            ctx.fill();
+            ctx.fillStyle = '#0f172a';
+            ctx.fillRect(-11, -8, 5, 3);
+            ctx.fillRect(6, -8, 5, 3);
+            ctx.fillRect(-11, 5, 5, 3);
+            ctx.fillRect(6, 5, 5, 3);
+            ctx.fillStyle = 'rgba(15, 23, 42, 0.78)';
+            ctx.beginPath();
+            this.roundRect(ctx, -7, -5.2, 14, 10.4, 3);
+            ctx.fill();
+            ctx.fillStyle = '#fef08a';
+            ctx.fillRect(11, -4, 2.8, 2.3);
+            ctx.fillRect(11, 1.8, 2.8, 2.3);
+            ctx.fillStyle = '#f87171';
+            ctx.fillRect(-13.8, -4, 2.8, 2.3);
+            ctx.fillRect(-13.8, 1.8, 2.8, 2.3);
           } else if (opts.type === 'police') {
             const blinkOn = Math.floor(opts.blink || 0) % 2 === 0;
+            ctx.fillStyle = '#dbeafe';
+            ctx.beginPath();
+            this.roundRect(ctx, -13, -7, 26, 14, 5);
+            ctx.fill();
+            ctx.fillStyle = '#0f172a';
+            ctx.fillRect(-11, -8, 5, 3);
+            ctx.fillRect(6, -8, 5, 3);
+            ctx.fillRect(-11, 5, 5, 3);
+            ctx.fillRect(6, 5, 5, 3);
+            ctx.fillStyle = 'rgba(30, 41, 59, 0.8)';
+            ctx.beginPath();
+            this.roundRect(ctx, -7.5, -5.3, 15, 10.6, 3);
+            ctx.fill();
             ctx.fillStyle = blinkOn ? '#3b82f6' : '#ef4444';
-            ctx.fillRect(-10, -6, 20, 12);
-            ctx.fillStyle = '#f8fafc';
-            ctx.fillRect(-4, -6, 8, 4);
+            ctx.fillRect(-2.8, -8.5, 2.8, 2.8);
+            ctx.fillRect(0.2, -8.5, 2.8, 2.8);
+            ctx.fillStyle = '#fef08a';
+            ctx.fillRect(11, -4, 2.8, 2.3);
+            ctx.fillRect(11, 1.8, 2.8, 2.3);
+            ctx.fillStyle = '#ef4444';
+            ctx.fillRect(-13.8, -4, 2.8, 2.3);
+            ctx.fillRect(-13.8, 1.8, 2.8, 2.3);
           }
           ctx.restore();
+        }
+
+        roundRect(ctx, x, y, w, h, r) {
+          const radius = Math.min(r, Math.abs(w) / 2, Math.abs(h) / 2);
+          ctx.moveTo(x + radius, y);
+          ctx.lineTo(x + w - radius, y);
+          ctx.arcTo(x + w, y, x + w, y + radius, radius);
+          ctx.lineTo(x + w, y + h - radius);
+          ctx.arcTo(x + w, y + h, x + w - radius, y + h, radius);
+          ctx.lineTo(x + radius, y + h);
+          ctx.arcTo(x, y + h, x, y + h - radius, radius);
+          ctx.lineTo(x, y + radius);
+          ctx.arcTo(x, y, x + radius, y, radius);
+          ctx.closePath();
         }
 
         drawEffects() {
@@ -920,14 +1338,16 @@
           }
 
           for (const p of this.police) {
-            this.drawEntity(p.lat, p.lon, { type: 'police', size: 10, blink: p.blink });
+            this.drawEntity(p.lat, p.lon, { type: 'police', size: 10, blink: p.blink, rot: p.dir || 0 });
           }
 
-          this.drawEntity(this.player.lat, this.player.lon, {
-            type: 'player',
-            size: this.player.inVehicle ? 0 : 9,
-            rot: this.player.heading
-          });
+          if (!this.player.inVehicle) {
+            this.drawEntity(this.player.lat, this.player.lon, {
+              type: 'player',
+              size: 9,
+              rot: this.player.heading
+            });
+          }
 
           this.drawEffects();
         }
